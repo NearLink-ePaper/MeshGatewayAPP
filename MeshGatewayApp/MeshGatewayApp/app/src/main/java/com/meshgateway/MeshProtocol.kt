@@ -3,24 +3,58 @@ package com.meshgateway
 /**
  * BLE-Mesh 网关通信协议
  *
- * 下行 (手机 → 网关):
- *   AA 01 DST_HI DST_LO LEN PAYLOAD   — 单播到指定节点
- *   AA 02 FF FF LEN PAYLOAD            — 广播到所有节点
- *   AA 03                               — 查询 mesh 拓扑
- *
- * 上行 (网关 → 手机):
- *   AA 81 SRC_HI SRC_LO LEN PAYLOAD   — 某节点发来的数据
- *   AA 83 GW_HI GW_LO COUNT [ADDR_HI ADDR_LO HOPS]...  — 拓扑响应
+ * v2 新增:
+ *   AA 08 DST(2) SEG_ID                              — 检查点 (网关→目标)
+ *   AA 87 SRC(2) TOTAL_HI TOTAL_LO BITMAP[30]        — 缺包位图 (目标→网关→APP)
+ *   AA 88 SRC(2) SEG_ID RX_COUNT(2)                   — 检查点应答 (目标→网关, 不转发APP)
+ *   AA 89 SRC(2) PHASE(1) RX_COUNT(2) TOTAL(2)       — 流控进度 (网关→APP)
  */
 object MeshProtocol {
 
     const val MAGIC = 0xAA
 
+    /* ── 下行命令码 ── */
+    const val CMD_UNICAST       = 0x01
+    const val CMD_BROADCAST     = 0x02
+    const val CMD_TOPO_QUERY    = 0x03
+    const val CMD_IMG_START     = 0x04
+    const val CMD_IMG_DATA      = 0x05
+    const val CMD_IMG_END       = 0x06
+    const val CMD_IMG_CANCEL    = 0x07
+    const val CMD_IMG_CHECKPOINT = 0x08  // v2: 检查点
+
+    /* ── 上行命令码 ── */
+    const val CMD_DATA_UP       = 0x81
+    const val CMD_TOPO_RESP     = 0x83
+    const val CMD_IMG_ACK       = 0x85
+    const val CMD_IMG_RESULT    = 0x86
+    const val CMD_IMG_MISSING   = 0x87  // v2: 位图格式
+    const val CMD_IMG_CHKPT_ACK = 0x88  // v2: 检查点应答 (网关内部处理, 不转发)
+    const val CMD_IMG_PROGRESS  = 0x89  // v2: 流控进度
+
+    /* ── 图片 ACK 状态 ── */
+    const val IMG_ACK_OK        = 0x00
+    const val IMG_ACK_RESEND    = 0x01
+    const val IMG_ACK_DONE      = 0xFF
+
+    /* ── 图片传输结果 ── */
+    const val IMG_RESULT_OK     = 0x00
+    const val IMG_RESULT_OOM    = 0x01
+    const val IMG_RESULT_TIMEOUT= 0x02
+    const val IMG_RESULT_CANCEL = 0x03
+    const val IMG_RESULT_CRC_ERR= 0x04
+
+    /* ── 取模模式 ── */
+    const val IMG_MODE_H_LSB    = 0x00
+
+    /* ── 分包参数 ── */
+    const val IMG_PKT_PAYLOAD   = 200
+
     /** 构造单播帧 */
     fun buildUnicast(dstAddr: Int, data: ByteArray): ByteArray {
         val frame = ByteArray(5 + data.size)
         frame[0] = MAGIC.toByte()
-        frame[1] = 0x01  // CMD_UNICAST
+        frame[1] = CMD_UNICAST.toByte()
         frame[2] = (dstAddr shr 8 and 0xFF).toByte()
         frame[3] = (dstAddr and 0xFF).toByte()
         frame[4] = data.size.toByte()
@@ -32,7 +66,7 @@ object MeshProtocol {
     fun buildBroadcast(data: ByteArray): ByteArray {
         val frame = ByteArray(5 + data.size)
         frame[0] = MAGIC.toByte()
-        frame[1] = 0x02  // CMD_BROADCAST
+        frame[1] = CMD_BROADCAST.toByte()
         frame[2] = 0xFF.toByte()
         frame[3] = 0xFF.toByte()
         frame[4] = data.size.toByte()
@@ -41,25 +75,103 @@ object MeshProtocol {
     }
 
     /** 构造拓扑查询帧: AA 03 */
-    fun buildTopoQuery(): ByteArray = byteArrayOf(MAGIC.toByte(), 0x03)
+    fun buildTopoQuery(): ByteArray = byteArrayOf(MAGIC.toByte(), CMD_TOPO_QUERY.toByte())
 
-    /** 解析上行 Notify 数据 */
+    /* ════════════════ 图片传输 — 下行帧 ════════════════ */
+
+    fun buildImageStart(dstAddr: Int, totalBytes: Int, pktCount: Int,
+                        width: Int, height: Int, mode: Int = IMG_MODE_H_LSB): ByteArray {
+        val frame = ByteArray(13)
+        frame[0]  = MAGIC.toByte()
+        frame[1]  = CMD_IMG_START.toByte()
+        frame[2]  = (dstAddr shr 8 and 0xFF).toByte()
+        frame[3]  = (dstAddr and 0xFF).toByte()
+        frame[4]  = (totalBytes shr 8 and 0xFF).toByte()
+        frame[5]  = (totalBytes and 0xFF).toByte()
+        frame[6]  = (pktCount shr 8 and 0xFF).toByte()
+        frame[7]  = (pktCount and 0xFF).toByte()
+        frame[8]  = (width shr 8 and 0xFF).toByte()
+        frame[9]  = (width and 0xFF).toByte()
+        frame[10] = (height shr 8 and 0xFF).toByte()
+        frame[11] = (height and 0xFF).toByte()
+        frame[12] = mode.toByte()
+        return frame
+    }
+
+    fun buildImageData(dstAddr: Int, seq: Int, data: ByteArray): ByteArray {
+        val frame = ByteArray(7 + data.size)
+        frame[0] = MAGIC.toByte()
+        frame[1] = CMD_IMG_DATA.toByte()
+        frame[2] = (dstAddr shr 8 and 0xFF).toByte()
+        frame[3] = (dstAddr and 0xFF).toByte()
+        frame[4] = (seq shr 8 and 0xFF).toByte()
+        frame[5] = (seq and 0xFF).toByte()
+        frame[6] = data.size.toByte()
+        data.copyInto(frame, 7)
+        return frame
+    }
+
+    fun buildImageEnd(dstAddr: Int, crc16: Int): ByteArray {
+        val frame = ByteArray(6)
+        frame[0] = MAGIC.toByte()
+        frame[1] = CMD_IMG_END.toByte()
+        frame[2] = (dstAddr shr 8 and 0xFF).toByte()
+        frame[3] = (dstAddr and 0xFF).toByte()
+        frame[4] = (crc16 shr 8 and 0xFF).toByte()
+        frame[5] = (crc16 and 0xFF).toByte()
+        return frame
+    }
+
+    fun buildImageCancel(dstAddr: Int): ByteArray {
+        val frame = ByteArray(4)
+        frame[0] = MAGIC.toByte()
+        frame[1] = CMD_IMG_CANCEL.toByte()
+        frame[2] = (dstAddr shr 8 and 0xFF).toByte()
+        frame[3] = (dstAddr and 0xFF).toByte()
+        return frame
+    }
+
+    /* ════════════════ 上行解析 ════════════════ */
+
     fun parseNotification(data: ByteArray): UpstreamMessage? {
         if (data.size < 2 || (data[0].toInt() and 0xFF) != MAGIC) return null
         val cmd = data[1].toInt() and 0xFF
         return when (cmd) {
-            0x81 -> parseDataMessage(data)
-            0x83 -> parseTopoResponse(data)
+            CMD_DATA_UP      -> parseDataMessage(data)
+            CMD_TOPO_RESP    -> parseTopoResponse(data)
+            CMD_IMG_ACK      -> parseImageAck(data)
+            CMD_IMG_RESULT   -> parseImageResult(data)
+            CMD_IMG_MISSING  -> parseImageMissing(data)
+            CMD_IMG_PROGRESS -> parseImageProgress(data)
             else -> null
         }
     }
 
-    private fun parseDataMessage(data: ByteArray): UpstreamMessage.DataFromNode? {
+    private fun parseDataMessage(data: ByteArray): UpstreamMessage? {
         if (data.size < 5) return null
         val srcAddr = (data[2].toInt() and 0xFF shl 8) or (data[3].toInt() and 0xFF)
         val payloadLen = data[4].toInt() and 0xFF
         if (data.size < 5 + payloadLen) return null
         val payload = data.copyOfRange(5, 5 + payloadLen)
+
+        if (payload.isNotEmpty()) {
+            when (payload[0].toInt() and 0xFF) {
+                CMD_IMG_RESULT -> {
+                    if (payload.size >= 2) {
+                        val status = payload[1].toInt() and 0xFF
+                        return UpstreamMessage.ImageResult(srcAddr, status)
+                    }
+                }
+                CMD_IMG_ACK -> {
+                    if (payload.size >= 4) {
+                        val status = payload[1].toInt() and 0xFF
+                        val seq = (payload[2].toInt() and 0xFF shl 8) or (payload[3].toInt() and 0xFF)
+                        return UpstreamMessage.ImageAck(srcAddr, status, seq)
+                    }
+                }
+            }
+        }
+
         return UpstreamMessage.DataFromNode(srcAddr, payload)
     }
 
@@ -78,15 +190,61 @@ object MeshProtocol {
         }
         return UpstreamMessage.Topology(gwAddr, nodes)
     }
+
+    private fun parseImageAck(data: ByteArray): UpstreamMessage.ImageAck? {
+        if (data.size < 7) return null
+        val srcAddr = (data[2].toInt() and 0xFF shl 8) or (data[3].toInt() and 0xFF)
+        val status = data[4].toInt() and 0xFF
+        val seq = (data[5].toInt() and 0xFF shl 8) or (data[6].toInt() and 0xFF)
+        return UpstreamMessage.ImageAck(srcAddr, status, seq)
+    }
+
+    private fun parseImageResult(data: ByteArray): UpstreamMessage.ImageResult? {
+        if (data.size < 5) return null
+        val srcAddr = (data[2].toInt() and 0xFF shl 8) or (data[3].toInt() and 0xFF)
+        val status = data[4].toInt() and 0xFF
+        return UpstreamMessage.ImageResult(srcAddr, status)
+    }
+
+    /** v2: 解析缺包位图: AA 87 SRC(2) TOTAL_HI TOTAL_LO BITMAP[30] */
+    private fun parseImageMissing(data: ByteArray): UpstreamMessage.ImageMissing? {
+        if (data.size < 6) return null
+        val srcAddr = (data[2].toInt() and 0xFF shl 8) or (data[3].toInt() and 0xFF)
+        val totalMissing = (data[4].toInt() and 0xFF shl 8) or (data[5].toInt() and 0xFF)
+        return UpstreamMessage.ImageMissing(srcAddr, totalMissing)
+    }
+
+    /** v2: 解析流控进度: AA 89 SRC(2) PHASE(1) RX_COUNT(2) TOTAL(2) */
+    private fun parseImageProgress(data: ByteArray): UpstreamMessage.ImageProgress? {
+        if (data.size < 9) return null
+        val srcAddr  = (data[2].toInt() and 0xFF shl 8) or (data[3].toInt() and 0xFF)
+        val phase    = data[4].toInt() and 0xFF
+        val rxCount  = (data[5].toInt() and 0xFF shl 8) or (data[6].toInt() and 0xFF)
+        val total    = (data[7].toInt() and 0xFF shl 8) or (data[8].toInt() and 0xFF)
+        return UpstreamMessage.ImageProgress(srcAddr, phase, rxCount, total)
+    }
+
+    /* ════════════════ CRC16 ════════════════ */
+
+    fun crc16(data: ByteArray): Int {
+        var crc = 0x0000
+        for (b in data) {
+            crc = crc xor ((b.toInt() and 0xFF) shl 8)
+            for (i in 0 until 8) {
+                crc = if (crc and 0x8000 != 0) {
+                    (crc shl 1) xor 0x1021
+                } else {
+                    crc shl 1
+                }
+                crc = crc and 0xFFFF
+            }
+        }
+        return crc
+    }
 }
 
-/** Mesh 网络节点信息 */
-data class MeshNode(
-    val addr: Int,
-    val hops: Int
-)
+data class MeshNode(val addr: Int, val hops: Int)
 
-/** 上行消息类型 */
 sealed class UpstreamMessage {
     data class DataFromNode(val srcAddr: Int, val payload: ByteArray) : UpstreamMessage() {
         override fun equals(other: Any?): Boolean {
@@ -98,8 +256,18 @@ sealed class UpstreamMessage {
     }
 
     data class Topology(val gatewayAddr: Int, val nodes: List<MeshNode>) : UpstreamMessage()
+
+    data class ImageAck(val srcAddr: Int, val status: Int, val seq: Int) : UpstreamMessage()
+
+    data class ImageResult(val srcAddr: Int, val status: Int) : UpstreamMessage()
+
+    /** v2: 缺包位图 (网关自主处理, APP 只看总数) */
+    data class ImageMissing(val srcAddr: Int, val totalMissing: Int) : UpstreamMessage()
+
+    /** v2: 网关流控进度 (phase: 0=首轮, 1=补包) */
+    data class ImageProgress(val srcAddr: Int, val phase: Int,
+                             val rxCount: Int, val total: Int) : UpstreamMessage()
 }
 
-/** 工具: ByteArray 转 hex 字符串 */
 fun ByteArray.toHexString(): String =
     joinToString("-") { String.format("%02X", it) }
