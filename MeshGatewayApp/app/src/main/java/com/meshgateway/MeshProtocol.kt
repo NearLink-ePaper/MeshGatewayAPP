@@ -27,6 +27,10 @@ object MeshProtocol {
     const val CMD_IMG_CANCEL    = 0x07
     const val CMD_IMG_CHECKPOINT = 0x08  // v2: 检查点
 
+    // === v3: 组播命令 ===
+    const val CMD_IMG_MCAST_START    = 0x0A  // 组播图片传输开始
+    const val CMD_IMG_MCAST_PROGRESS = 0x8A  // 组播进度通知 (网关→APP)
+
     /* ── 上行命令码 ── */
     const val CMD_DATA_UP       = 0x81
     const val CMD_TOPO_RESP     = 0x83
@@ -147,6 +151,41 @@ object MeshProtocol {
         return frame
     }
 
+    /**
+     * 构建组播图片传输 START 帧
+     *
+     * 帧格式: AA 0A N(1) ADDR1(2)...ADDRn(2) TOTAL(2) PKT(2) W(2) H(2) MODE(1)
+     */
+    fun buildImageMulticastStart(
+        targets: List<Int>,
+        totalBytes: Int,
+        pktCount: Int,
+        width: Int,
+        height: Int,
+        mode: Int = 0
+    ): ByteArray {
+        val n = targets.size.coerceAtMost(8)
+        val buf = ByteArray(2 + 1 + n * 2 + 9)
+        var pos = 0
+        buf[pos++] = MAGIC.toByte()
+        buf[pos++] = CMD_IMG_MCAST_START.toByte()
+        buf[pos++] = n.toByte()
+        for (i in 0 until n) {
+            buf[pos++] = (targets[i] shr 8).toByte()
+            buf[pos++] = (targets[i] and 0xFF).toByte()
+        }
+        buf[pos++] = (totalBytes shr 8).toByte()
+        buf[pos++] = (totalBytes and 0xFF).toByte()
+        buf[pos++] = (pktCount shr 8).toByte()
+        buf[pos++] = (pktCount and 0xFF).toByte()
+        buf[pos++] = (width shr 8).toByte()
+        buf[pos++] = (width and 0xFF).toByte()
+        buf[pos++] = (height shr 8).toByte()
+        buf[pos++] = (height and 0xFF).toByte()
+        buf[pos++] = mode.toByte()
+        return buf
+    }
+
     /* ════════════════ 上行解析 ════════════════ */
 
     fun parseNotification(data: ByteArray): UpstreamMessage? {
@@ -159,6 +198,7 @@ object MeshProtocol {
             CMD_IMG_RESULT   -> parseImageResult(data)
             CMD_IMG_MISSING  -> parseImageMissing(data)
             CMD_IMG_PROGRESS -> parseImageProgress(data)
+            CMD_IMG_MCAST_PROGRESS -> parseMulticastProgress(data)
             else -> null
         }
     }
@@ -240,6 +280,16 @@ object MeshProtocol {
         return UpstreamMessage.ImageProgress(srcAddr, phase, rxCount, total)
     }
 
+    /** v3: 解析组播进度: AA 8A COMPLETED(1) TOTAL(1) ADDR(2) STATUS(1) */
+    private fun parseMulticastProgress(data: ByteArray): UpstreamMessage.MulticastProgress? {
+        if (data.size < 7) return null
+        val completed = data[2].toInt() and 0xFF
+        val total     = data[3].toInt() and 0xFF
+        val addr      = ((data[4].toInt() and 0xFF) shl 8) or (data[5].toInt() and 0xFF)
+        val status    = data[6].toInt() and 0xFF
+        return UpstreamMessage.MulticastProgress(completed, total, addr, status)
+    }
+
     /* ════════════════ CRC16 ════════════════ */
 
     fun crc16(data: ByteArray): Int {
@@ -283,6 +333,14 @@ sealed class UpstreamMessage {
     /** v2: 网关流控进度 (phase: 0=首轮, 1=补包) */
     data class ImageProgress(val srcAddr: Int, val phase: Int,
                              val rxCount: Int, val total: Int) : UpstreamMessage()
+
+    /** v3: 组播进度通知 */
+    data class MulticastProgress(
+        val completedCount: Int,
+        val totalTargets: Int,
+        val latestAddr: Int,
+        val latestStatus: Int
+    ) : UpstreamMessage()
 }
 
 fun ByteArray.toHexString(): String =

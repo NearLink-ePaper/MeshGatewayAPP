@@ -25,11 +25,15 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -255,12 +259,18 @@ fun MeshApp(
     val appContext = LocalContext.current.applicationContext
     var lastSentBitmaps by remember { mutableStateOf(NodeImageStore.loadAll(appContext)) }
 
+    var mcastSelected by remember { mutableStateOf(setOf<Int>()) }
+    var mcastSendTargets by remember { mutableStateOf<List<Int>>(emptyList()) }
+    var pendingSaveBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var pendingSaveAddrs by remember { mutableStateOf<List<Int>>(emptyList()) }
+
     val imageBusy = imgSendState is BleManager.ImageSendState.Sending
             || imgSendState is BleManager.ImageSendState.WaitingAck
             || imgSendState is BleManager.ImageSendState.Finishing
             || imgSendState is BleManager.ImageSendState.MeshTransfer
+            || imgSendState is BleManager.ImageSendState.MulticastTransfer
 
-    fun clearTopologyState() { nodes = listOf(); gwAddr = 0; logs = listOf() }
+    fun clearTopologyState() { nodes = listOf(); gwAddr = 0; logs = listOf(); mcastSelected = emptySet() }
     fun addLog(s: String) { logs = (logs + LogEntry(s)).takeLast(50) }
 
     DisposableEffect(ble) {
@@ -292,6 +302,10 @@ fun MeshApp(
                     val phase = if (msg.phase == 0) "传输" else "补包"
                     addLog("← [0x${h4(msg.srcAddr)}] Mesh${phase}: ${msg.rxCount}/${msg.total}")
                 }
+                is UpstreamMessage.MulticastProgress -> {
+                    val statusText = when (msg.latestStatus) { 0 -> "成功"; 1 -> "OOM"; 2 -> "超时"; 4 -> "CRC"; else -> "失败(${msg.latestStatus})" }
+                    addLog("← 组播 ${msg.completedCount}/${msg.totalTargets} [0x${h4(msg.latestAddr)}] $statusText")
+                }
             }
         }
         onDispose { ble.onMessage = null }
@@ -309,7 +323,7 @@ fun MeshApp(
         if (state == BleManager.ConnState.CONNECTED && cccdReady) {
             while (isActive) {
                 delay(30_000L)
-                if (!ble.isImageBusy && state == BleManager.ConnState.CONNECTED) {
+                if (!ble.isImageBusy && state == BleManager.ConnState.CONNECTED && mcastSelected.isEmpty()) {
                     if (ble.queryTopology()) addLog("→ 自动刷新拓扑")
                 }
             }
@@ -355,11 +369,30 @@ fun MeshApp(
                 BleManager.ConnState.CONNECTING -> CenterContent("正在连接 $devName ...")
                 BleManager.ConnState.CONNECTED ->
                     ConnectedPage(devName, gwAddr, nodes, logs, debug, topoQuerying, cccdReady, imgSendState,
+                        multicastSelected = mcastSelected,
                         onQueryTopo = { if (!ble.isImageBusy && ble.queryTopology()) addLog("→ 查询拓扑") },
                         onDisconnect = { clearTopologyState(); ble.disconnect() },
                         onNodeClick = { if (!imageBusy) dlgNode = it },
-                        onBroadcast = { txt -> if (!imageBusy) { ble.broadcast(txt.toByteArray()); addLog("→ [广播] $txt") } },
-                        onCancelImage = { ble.cancelImageSend(); addLog("→ 取消图片传输") }
+                        onCancelImage = { ble.cancelImageSend(); addLog("→ 取消图片传输") },
+                        onToggleMulticast = { addr ->
+                            mcastSelected = if (addr in mcastSelected) mcastSelected - addr else mcastSelected + addr
+                        },
+                        onMulticastSend = {
+                            if (mcastSelected.isNotEmpty() && !imageBusy) {
+                                mcastSendTargets = mcastSelected.toList()
+                                imgTargetNode = MeshNode(0xFFFF, 0)
+                                onPickImage()
+                            }
+                        },
+                        onNodeLongPress = { node ->
+                            if (!imageBusy) {
+                                if (mcastSelected.isNotEmpty()) {
+                                    mcastSelected = emptySet()
+                                } else {
+                                    mcastSelected = mcastSelected + node.addr
+                                }
+                            }
+                        }
                     )
             }
 
@@ -385,31 +418,69 @@ fun MeshApp(
             if (cropBmp != null && cropNode != null) {
                 CropImageDialog(
                     originalBitmap = cropBmp, node = cropNode,
-                    onDismiss = { imgCropBitmap = null; imgTargetNode = null },
+                    multicastCount = mcastSendTargets.size,
+                    onDismiss = { imgCropBitmap = null; imgTargetNode = null; mcastSendTargets = emptyList() },
                     onConfirm = { cropped, res ->
                         imgCropBitmap = null
-                        imgPreviewData = ImagePreviewData(cropNode, cropped, res)
+                        imgPreviewData = ImagePreviewData(cropNode, cropped, res, mcastSendTargets)
                     }
                 )
             }
 
             /* ── 预览 & 发送 ── */
             imgPreviewData?.let { data ->
-                ImagePreviewDialog(data, onDismiss = { imgPreviewData = null; imgTargetNode = null },
+                ImagePreviewDialog(data, onDismiss = { imgPreviewData = null; imgTargetNode = null; mcastSendTargets = emptyList() },
                     onSend = { processedData, w, h, mode, previewBmp ->
-                        val ok = ble.sendImage(data.node.addr, processedData, w, h, mode)
-                        if (ok) {
-                            lastSentBitmaps = lastSentBitmaps + (data.node.addr to previewBmp)
-                            NodeImageStore.save(appContext, data.node.addr, previewBmp)
-                            addLog("→ 图片 ${w}x${h} → 0x${h4(data.node.addr)} ${processedData.size}B ${if (mode == BleManager.ImageSendMode.FAST) "快速" else "ACK"} ${data.node.hops}跳")
-                        } else addLog("图片发送失败 (正在发送中或未连接)")
-                        imgPreviewData = null; imgTargetNode = null
+                        if (data.multicastTargets.isNotEmpty()) {
+                            val ok = ble.sendImageMulticast(data.multicastTargets, processedData, w, h)
+                            if (ok) {
+                                pendingSaveBitmap = previewBmp
+                                pendingSaveAddrs = data.multicastTargets
+                                addLog("→ 组播图片 ${w}x${h} → ${data.multicastTargets.size}个节点 ${processedData.size}B")
+                            } else addLog("组播发送失败 (正在发送中或未连接)")
+                        } else {
+                            val ok = ble.sendImage(data.node.addr, processedData, w, h, mode)
+                            if (ok) {
+                                pendingSaveBitmap = previewBmp
+                                pendingSaveAddrs = listOf(data.node.addr)
+                                addLog("→ 图片 ${w}x${h} → 0x${h4(data.node.addr)} ${processedData.size}B ${if (mode == BleManager.ImageSendMode.FAST) "快速" else "ACK"} ${data.node.hops}跳")
+                            } else addLog("图片发送失败 (正在发送中或未连接)")
+                        }
+                        imgPreviewData = null; imgTargetNode = null; mcastSendTargets = emptyList()
                     }
                 )
             }
 
             LaunchedEffect(imgSendState) {
-                if (imgSendState is BleManager.ImageSendState.Done || imgSendState is BleManager.ImageSendState.Cancelled) {
+                val curState = imgSendState
+                val bmp = pendingSaveBitmap
+                if (bmp != null) {
+                    when (curState) {
+                        is BleManager.ImageSendState.Done -> {
+                            if (curState.success) {
+                                for (addr in pendingSaveAddrs) {
+                                    lastSentBitmaps = lastSentBitmaps + (addr to bmp)
+                                    NodeImageStore.save(appContext, addr, bmp)
+                                }
+                            }
+                            pendingSaveBitmap = null; pendingSaveAddrs = emptyList()
+                        }
+                        is BleManager.ImageSendState.MulticastDone -> {
+                            val successAddrs = curState.results.filter { it.value == 0 }.keys
+                            for (addr in successAddrs) {
+                                lastSentBitmaps = lastSentBitmaps + (addr to bmp)
+                                NodeImageStore.save(appContext, addr, bmp)
+                            }
+                            pendingSaveBitmap = null; pendingSaveAddrs = emptyList()
+                        }
+                        is BleManager.ImageSendState.Cancelled -> {
+                            pendingSaveBitmap = null; pendingSaveAddrs = emptyList()
+                        }
+                        else -> {}
+                    }
+                }
+                if (curState is BleManager.ImageSendState.Done || curState is BleManager.ImageSendState.Cancelled
+                    || curState is BleManager.ImageSendState.MulticastDone) {
                     kotlinx.coroutines.delay(3000); ble.resetImageSendState()
                 }
             }
@@ -455,15 +526,19 @@ fun ScanPage(scanning: Boolean, devices: List<BleManager.ScannedDevice>, onScan:
  *  连接页 (不变)
  * ════════════════════════════════════════════════════════════ */
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ConnectedPage(
     devName: String, gwAddr: Int, nodes: List<MeshNode>, logs: List<LogEntry>, debugText: String,
     topoQuerying: Boolean, cccdReady: Boolean, imgSendState: BleManager.ImageSendState,
+    multicastSelected: Set<Int> = emptySet(),
     onQueryTopo: () -> Unit, onDisconnect: () -> Unit, onNodeClick: (MeshNode) -> Unit,
-    onBroadcast: (String) -> Unit, onCancelImage: () -> Unit
+    onCancelImage: () -> Unit,
+    onToggleMulticast: (Int) -> Unit = {}, onMulticastSend: () -> Unit = {},
+    onNodeLongPress: (MeshNode) -> Unit = {}
 ) {
-    var bcastText by remember { mutableStateOf("") }
-    Column(Modifier.fillMaxSize()) {
+    val inMulticastMode = multicastSelected.isNotEmpty()
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF2A2A3A)), shape = RoundedCornerShape(8.dp)) {
             Text(debugText, Modifier.padding(8.dp), fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = Color(0xFFFFEB3B))
         }
@@ -487,7 +562,21 @@ fun ConnectedPage(
                 nodes.chunked(2).forEach { rowNodes ->
                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         rowNodes.forEach { node ->
-                            Card(Modifier.weight(1f).clickable { onNodeClick(node) }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(10.dp)) {
+                            val isSelected = node.addr in multicastSelected
+                            Card(
+                                Modifier.weight(1f).combinedClickable(
+                                    onClick = {
+                                        if (inMulticastMode) onToggleMulticast(node.addr)
+                                        else onNodeClick(node)
+                                    },
+                                    onLongClick = { onNodeLongPress(node) }
+                                ),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isSelected) Color(0xFF9C27B0).copy(alpha = 0.2f)
+                                                     else MaterialTheme.colorScheme.surface
+                                ),
+                                shape = RoundedCornerShape(10.dp)
+                            ) {
                                 Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
                                     Box(Modifier.size(32.dp).clip(RoundedCornerShape(6.dp)).background(if (node.hops == 0) Color(0xFF4CAF50).copy(alpha = 0.15f) else MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)), Alignment.Center) {
                                         Icon(if (node.hops == 0) Icons.Default.Router else Icons.Default.Memory, null, tint = if (node.hops == 0) Color(0xFF4CAF50) else MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
@@ -497,7 +586,14 @@ fun ConnectedPage(
                                         Text("0x${h4(node.addr)}", fontWeight = FontWeight.Bold, fontFamily = FontFamily.Monospace, color = Color.White, fontSize = 13.sp)
                                         Text(when (node.hops) { 0 -> "网关"; 1 -> "直连"; else -> "${node.hops} 跳" }, fontSize = 11.sp, color = when (node.hops) { 0 -> Color(0xFF4CAF50); 1 -> Color(0xFF4CAF50); else -> Color(0xFFFFA726) })
                                     }
-                                    Icon(Icons.Default.Send, "发送", tint = Color.Gray, modifier = Modifier.size(16.dp))
+                                    if (inMulticastMode) {
+                                        Checkbox(
+                                            checked = isSelected,
+                                            onCheckedChange = { onToggleMulticast(node.addr) },
+                                            modifier = Modifier.size(20.dp),
+                                            colors = CheckboxDefaults.colors(checkedColor = Color(0xFF9C27B0), uncheckedColor = Color.Gray)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -506,16 +602,20 @@ fun ConnectedPage(
                 }
             }
         }
-        Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(10.dp)) {
-            Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(value = bcastText, onValueChange = { bcastText = it }, modifier = Modifier.weight(1f), placeholder = { Text("输入广播数据...", color = Color.Gray) }, singleLine = true,
-                    colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = MaterialTheme.colorScheme.primary, unfocusedBorderColor = Color.Gray.copy(alpha = 0.3f), focusedTextColor = Color.White, unfocusedTextColor = Color.White, cursorColor = MaterialTheme.colorScheme.primary))
-                Spacer(Modifier.width(8.dp))
-                IconButton(onClick = { if (bcastText.isNotBlank()) { onBroadcast(bcastText); bcastText = "" } }) { Icon(Icons.Default.Send, "广播", tint = MaterialTheme.colorScheme.primary) }
+        if (multicastSelected.isNotEmpty()) {
+            Button(
+                onClick = onMulticastSend,
+                enabled = !isImageBusy(imgSendState),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF9C27B0))
+            ) {
+                Icon(Icons.Default.Image, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("组播发送到 ${multicastSelected.size} 个节点")
             }
         }
         Text("  通信日志", Modifier.padding(start = 16.dp, top = 4.dp, bottom = 4.dp), fontSize = 14.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
-        LazyColumn(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+        LazyColumn(Modifier.heightIn(max = 300.dp).padding(horizontal = 12.dp)) {
             items(logs.reversed()) { entry ->
                 Text("${entry.time}  ${entry.msg}", fontSize = 11.sp, fontFamily = FontFamily.Monospace,
                     color = when { entry.msg.startsWith("→") -> Color(0xFF64B5F6); entry.msg.startsWith("←") -> Color(0xFF81C784); else -> Color(0xFFBDBDBD) }, modifier = Modifier.padding(vertical = 1.dp))
@@ -649,6 +749,29 @@ fun ImageProgressBar(state: BleManager.ImageSendState, onCancel: () -> Unit) {
                 }
             }
         }
+        is BleManager.ImageSendState.MulticastTransfer -> {
+            Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF4A148C).copy(alpha = 0.4f)), shape = RoundedCornerShape(8.dp)) {
+                Column(Modifier.padding(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("组播传输中 ${state.completedCount}/${state.totalTargets}", fontSize = 12.sp, color = Color.White, modifier = Modifier.weight(1f))
+                        Spacer(Modifier.width(8.dp))
+                        IconButton(onClick = onCancel, modifier = Modifier.size(24.dp)) { Icon(Icons.Default.Close, "取消", tint = Color(0xFFEF5350), modifier = Modifier.size(16.dp)) }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    AnimatedStripeBar(color = Color(0xFFCE93D8))
+                }
+            }
+        }
+        is BleManager.ImageSendState.MulticastDone -> {
+            val successCount = state.results.count { it.value == 0 }
+            val allSuccess = successCount == state.results.size
+            Card(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp), colors = CardDefaults.cardColors(containerColor = if (allSuccess) Color(0xFF1B5E20).copy(alpha = 0.3f) else Color(0xFFB71C1C).copy(alpha = 0.3f)), shape = RoundedCornerShape(8.dp)) {
+                Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(if (allSuccess) Icons.Default.CheckCircle else Icons.Default.Warning, null, tint = if (allSuccess) Color(0xFF4CAF50) else Color(0xFFFFA726), modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp)); Text("组播完成 $successCount/${state.results.size}", fontSize = 12.sp, color = if (allSuccess) Color(0xFF81C784) else Color(0xFFEF9A9A))
+                }
+            }
+        }
     }
 }
 
@@ -710,7 +833,7 @@ fun NodeActionDialog(node: MeshNode, lastSentBitmap: Bitmap? = null, onDismiss: 
  * ════════════════════════════════════════════════════════════ */
 
 @Composable
-fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, onDismiss: () -> Unit,
+fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, multicastCount: Int = 0, onDismiss: () -> Unit,
                     onConfirm: (Bitmap, ImageResolution) -> Unit) {
 
     var selectedRes by remember { mutableStateOf(IMG_RESOLUTIONS[0]) }
@@ -743,7 +866,7 @@ fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, onDismiss: () -> Uni
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Card(Modifier.fillMaxWidth(0.92f), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E2E))) {
             Column(Modifier.padding(16.dp)) {
-                Text("裁剪图片 → 0x${h4(node.addr)}", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 16.sp)
+                Text(if (multicastCount > 0) "裁剪图片 → 组播 $multicastCount 个节点" else "裁剪图片 → 0x${h4(node.addr)}", fontWeight = FontWeight.Bold, color = Color.White, fontSize = 16.sp)
                 Spacer(Modifier.height(4.dp))
                 Text("拖动裁剪框调整区域，拖动四角缩放", fontSize = 11.sp, color = Color.Gray)
                 Spacer(Modifier.height(12.dp))
@@ -901,7 +1024,8 @@ fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, onDismiss: () -> Uni
 data class ImagePreviewData(
     val node: MeshNode,
     val croppedBitmap: Bitmap,     // 用户裁剪后的原图
-    val resolution: ImageResolution
+    val resolution: ImageResolution,
+    val multicastTargets: List<Int> = emptyList() // 组播目标节点地址 (空=单播)
 )
 
 /* ════════════════════════════════════════════════════════════
@@ -923,7 +1047,7 @@ fun ImagePreviewDialog(data: ImagePreviewData, onDismiss: () -> Unit,
     zoomBitmap?.let { ZoomImageDialog(it, zoomTitle) { zoomBitmap = null } }
 
     AlertDialog(onDismissRequest = onDismiss, containerColor = MaterialTheme.colorScheme.surface,
-        title = { Text("发送到 0x${h4(data.node.addr)}", color = Color.White, fontSize = 16.sp) },
+        title = { Text(if (data.multicastTargets.isNotEmpty()) "组播发送到 ${data.multicastTargets.size} 个节点" else "发送到 0x${h4(data.node.addr)}", color = Color.White, fontSize = 16.sp) },
         text = {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
 
@@ -959,20 +1083,22 @@ fun ImagePreviewDialog(data: ImagePreviewData, onDismiss: () -> Unit,
                     fontSize = 10.sp, color = Color.Gray)
 
                 Spacer(Modifier.height(12.dp))
-                Text("传输模式", fontSize = 12.sp, color = Color(0xFFB0BEC5), modifier = Modifier.align(Alignment.Start))
-                Spacer(Modifier.height(4.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(selected = selectedMode == BleManager.ImageSendMode.FAST, onClick = { selectedMode = BleManager.ImageSendMode.FAST },
-                        label = { Text("快速", fontSize = 12.sp) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFF4CAF50).copy(alpha = 0.3f), selectedLabelColor = Color.White))
-                    FilterChip(selected = selectedMode == BleManager.ImageSendMode.ACK, onClick = { selectedMode = BleManager.ImageSendMode.ACK },
-                        label = { Text("逐包确认", fontSize = 12.sp) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFFFFA726).copy(alpha = 0.3f), selectedLabelColor = Color.White))
+                if (data.multicastTargets.isEmpty()) {
+                    Text("传输模式", fontSize = 12.sp, color = Color(0xFFB0BEC5), modifier = Modifier.align(Alignment.Start))
+                    Spacer(Modifier.height(4.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(selected = selectedMode == BleManager.ImageSendMode.FAST, onClick = { selectedMode = BleManager.ImageSendMode.FAST },
+                            label = { Text("快速", fontSize = 12.sp) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFF4CAF50).copy(alpha = 0.3f), selectedLabelColor = Color.White))
+                        FilterChip(selected = selectedMode == BleManager.ImageSendMode.ACK, onClick = { selectedMode = BleManager.ImageSendMode.ACK },
+                            label = { Text("逐包确认", fontSize = 12.sp) }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = Color(0xFFFFA726).copy(alpha = 0.3f), selectedLabelColor = Color.White))
+                    }
                 }
             }
         },
         confirmButton = {
             Button(onClick = { onSend(processed.imageData, data.resolution.width, data.resolution.height, selectedMode, processed.previewBitmap) },
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)) {
-                Icon(Icons.Default.Send, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("发送 (${processed.dataSize}B)")
+                colors = ButtonDefaults.buttonColors(containerColor = if (data.multicastTargets.isNotEmpty()) Color(0xFF9C27B0) else MaterialTheme.colorScheme.primary)) {
+                Icon(Icons.Default.Send, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text(if (data.multicastTargets.isNotEmpty()) "组播发送 (${processed.dataSize}B)" else "发送 (${processed.dataSize}B)")
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = Color.Gray) } }
@@ -1084,6 +1210,7 @@ fun h4(addr: Int): String = String.format("%04X", addr)
 fun isImageBusy(state: BleManager.ImageSendState): Boolean =
     state is BleManager.ImageSendState.Sending || state is BleManager.ImageSendState.WaitingAck
             || state is BleManager.ImageSendState.Finishing || state is BleManager.ImageSendState.MeshTransfer
+            || state is BleManager.ImageSendState.MulticastTransfer
 fun ByteArray.decodeToStringOrHex(): String = try {
     val s = toString(Charsets.UTF_8)
     if (s.all { it.code >= 0x20 && it != '\uFFFD' }) s else toHexString()

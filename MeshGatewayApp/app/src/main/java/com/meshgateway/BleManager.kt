@@ -53,6 +53,18 @@ class BleManager(private val context: Context) {
         object Finishing : ImageSendState()
         data class Done(val success: Boolean, val msg: String) : ImageSendState()
         data class Cancelled(val msg: String = "已取消") : ImageSendState()
+
+        /** v3: 组播传输中 */
+        data class MulticastTransfer(
+            val completedCount: Int,
+            val totalTargets: Int,
+            val results: Map<Int, Int>  // addr → status (0=OK, 1=OOM, 2=timeout, 4=CRC_ERR)
+        ) : ImageSendState()
+
+        /** v3: 组播完成 */
+        data class MulticastDone(
+            val results: Map<Int, Int>  // 最终每个节点的状态
+        ) : ImageSendState()
     }
 
     data class ScannedDevice(
@@ -102,6 +114,7 @@ class BleManager(private val context: Context) {
         val s = _imageSendState.value
         return s is ImageSendState.Sending || s is ImageSendState.WaitingAck
                 || s is ImageSendState.Finishing || s is ImageSendState.MeshTransfer
+                || s is ImageSendState.MulticastTransfer
     }
 
     private var imgDstAddr: Int = 0
@@ -117,6 +130,7 @@ class BleManager(private val context: Context) {
     private val imgAckTimeout = Runnable { onImageAckTimeout() }
     private val imgResultTimeout = Runnable { onImageResultTimeout() }
     private val imgFastPacedSender = Runnable { imgSendNextFastPaced() }
+    private var imgMulticastTargets: List<Int>? = null  // null=单播, non-null=组播
 
     private fun hasScanPermission(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -392,6 +406,7 @@ class BleManager(private val context: Context) {
             if (msg is UpstreamMessage.ImageResult) handleImageResult(msg)
             if (msg is UpstreamMessage.ImageProgress) handleImageProgress(msg)
             if (msg is UpstreamMessage.ImageMissing) handleImageMissing(msg)
+            if (msg is UpstreamMessage.MulticastProgress) handleMulticastProgress(msg)
             onMessage?.invoke(msg)
         }
     }
@@ -470,7 +485,46 @@ class BleManager(private val context: Context) {
      *    2. 显示 BLE 上传进度 → Mesh 传输进度 → 结果
      *
      *  v2.1: ACK 模式通过 xfer=1 告知网关立即注入 mesh, 不缓存
+     *
+     *  v3: 组播模式 (MCAST_START + DATA×N + END, 网关通过 0x8A 通知各节点状态)
      * ════════════════════════════════════════════════════════════ */
+
+    /** v3: 组播发送图片到多个目标节点 */
+    fun sendImageMulticast(targets: List<Int>, data: ByteArray, width: Int, height: Int): Boolean {
+        if (targets.isEmpty() || targets.size > 8) return false
+        val curState = _imageSendState.value
+        if (curState is ImageSendState.Sending || curState is ImageSendState.WaitingAck
+            || curState is ImageSendState.Finishing || curState is ImageSendState.MeshTransfer
+            || curState is ImageSendState.MulticastTransfer) {
+            Log.w(TAG, "sendImageMulticast: already in progress")
+            return false
+        }
+        if (gatt == null || rxChar == null) return false
+
+        imgDstAddr = 0xFFFF  // 组播数据包使用广播地址
+        imgData = data
+        imgWidth = width
+        imgHeight = height
+        imgMode = ImageSendMode.FAST
+        imgCancelled.set(false)
+        imgNextSeq = 0
+        imgMulticastTargets = targets
+
+        imgPackets = data.toList().chunked(MeshProtocol.IMG_PKT_PAYLOAD).map { it.toByteArray() }
+        imgTotalPkts = imgPackets.size
+
+        Log.d(TAG, "sendImageMulticast: targets=${targets.map { "0x${String.format("%04X", it)}" }} " +
+                "${width}x${height} data=${data.size}B pkts=$imgTotalPkts")
+
+        // 1) 发送 MCAST_START
+        sendRaw(MeshProtocol.buildImageMulticastStart(targets, data.size, imgTotalPkts, width, height, 0))
+
+        // 2) 开始发送数据分包 (FAST 模式)
+        _imageSendState.value = ImageSendState.Sending(0, imgTotalPkts, ImageSendMode.FAST)
+        imgSendAllPacketsFast()
+
+        return true
+    }
 
     fun sendImage(dstAddr: Int, data: ByteArray, width: Int, height: Int,
                   mode: ImageSendMode = ImageSendMode.FAST): Boolean {
@@ -490,6 +544,7 @@ class BleManager(private val context: Context) {
         imgMode = mode
         imgCancelled.set(false)
         imgNextSeq = 0
+        imgMulticastTargets = null  // 单播模式
 
         imgPackets = data.toList().chunked(MeshProtocol.IMG_PKT_PAYLOAD).map { it.toByteArray() }
         imgTotalPkts = imgPackets.size
@@ -557,18 +612,24 @@ class BleManager(private val context: Context) {
         if (imgCancelled.get()) return
         val state = _imageSendState.value
         if (state !is ImageSendState.Sending && state !is ImageSendState.MeshTransfer
-            && state !is ImageSendState.Finishing) return
+            && state !is ImageSendState.Finishing && state !is ImageSendState.MulticastTransfer) return
 
         val sent = imgFastSeq.coerceIn(0, imgTotalPkts)
 
         if (sent >= imgTotalPkts) {
-            // BLE 上传完成 → 等待网关流控
+            // BLE 上传完成 → 等待网关流控/组播
             if (state is ImageSendState.Sending) {
-                _imageSendState.value = ImageSendState.MeshTransfer(0, 0, 0)
-                _debugInfo.value = "上传完成, 等待网关通知..."
+                val mcastTargets = imgMulticastTargets
+                if (mcastTargets != null) {
+                    _imageSendState.value = ImageSendState.MulticastTransfer(0, mcastTargets.size, emptyMap())
+                    _debugInfo.value = "上传完成, 等待组播通知..."
+                } else {
+                    _imageSendState.value = ImageSendState.MeshTransfer(0, 0, 0)
+                    _debugInfo.value = "上传完成, 等待网关通知..."
+                }
             }
-            // v2: 动态超时 = 30s + 0.5s × 包数
-            val timeoutMs = 30000L + imgTotalPkts * 500L
+            // v2: 动态超时 = 30s + 0.5s × 包数 (组播额外加时)
+            val timeoutMs = 30000L + imgTotalPkts * 500L + (imgMulticastTargets?.size ?: 0) * 10000L
             handler.removeCallbacks(imgResultTimeout)
             handler.postDelayed(imgResultTimeout, timeoutMs)
             Log.d(TAG, "BLE upload done, waiting for gateway FC result (timeout=${timeoutMs}ms)")
@@ -662,6 +723,39 @@ class BleManager(private val context: Context) {
         handler.postDelayed(imgResultTimeout, timeoutMs)
     }
 
+    /** v3: 处理组播进度通知 (AA 8A) */
+    private fun handleMulticastProgress(progress: UpstreamMessage.MulticastProgress) {
+        Log.d(TAG, "handleMulticastProgress: ${progress.completedCount}/${progress.totalTargets} " +
+                "addr=0x${String.format("%04X", progress.latestAddr)} status=${progress.latestStatus}")
+
+        val curState = _imageSendState.value
+        if (curState !is ImageSendState.MulticastTransfer && curState !is ImageSendState.Sending) return
+
+        val newResults = if (curState is ImageSendState.MulticastTransfer)
+            curState.results.toMutableMap() else mutableMapOf()
+        newResults[progress.latestAddr] = progress.latestStatus
+
+        if (progress.completedCount >= progress.totalTargets) {
+            // 所有目标完成
+            _imageSendState.value = ImageSendState.MulticastDone(newResults)
+            _debugInfo.value = "组播完成: ${newResults.count { it.value == 0 }}/${newResults.size} 成功"
+            handler.removeCallbacks(imgResultTimeout)
+            handler.removeCallbacks(fastProgressTracker)
+            imgCleanup()
+        } else {
+            _imageSendState.value = ImageSendState.MulticastTransfer(
+                progress.completedCount, progress.totalTargets, newResults
+            )
+            val statusText = when (progress.latestStatus) { 0 -> "成功"; 1 -> "OOM"; 2 -> "超时"; 4 -> "CRC"; else -> "失败" }
+            _debugInfo.value = "组播进度: ${progress.completedCount}/${progress.totalTargets} [0x${String.format("%04X", progress.latestAddr)}=$statusText]"
+
+            // 重置超时
+            handler.removeCallbacks(imgResultTimeout)
+            val timeoutMs = 30000L + imgTotalPkts * 500L + (imgMulticastTargets?.size ?: 0) * 10000L
+            handler.postDelayed(imgResultTimeout, timeoutMs)
+        }
+    }
+
     /** v2: 处理缺包通知 (AA 87) — 网关自主补包, APP 只显示信息 */
     private fun handleImageMissing(missing: UpstreamMessage.ImageMissing) {
         Log.d(TAG, "handleImageMissing: ${missing.totalMissing} packets missing")
@@ -723,6 +817,10 @@ class BleManager(private val context: Context) {
                 "未收到目标节点确认(网关传输可能超时)")
             _debugInfo.value = "传输超时, 建议检查网络后重试"
             imgCleanup()
+        } else if (curState is ImageSendState.MulticastTransfer) {
+            _imageSendState.value = ImageSendState.MulticastDone(curState.results)
+            _debugInfo.value = "组播超时: ${curState.completedCount}/${curState.totalTargets} 已完成"
+            imgCleanup()
         }
     }
 
@@ -744,5 +842,6 @@ class BleManager(private val context: Context) {
     private fun imgCleanup() {
         imgData = null
         imgPackets = emptyList()
+        imgMulticastTargets = null
     }
 }
