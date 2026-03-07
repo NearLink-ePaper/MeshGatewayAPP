@@ -318,12 +318,15 @@ fun MeshApp(
         }
     }
 
-    // 定时自动查询拓扑 (每30秒, 图片传输中跳过)
+    // 定时自动查询拓扑 (每30秒, 图片传输中/操作对话框打开时跳过)
     LaunchedEffect(state, cccdReady) {
         if (state == BleManager.ConnState.CONNECTED && cccdReady) {
             while (isActive) {
                 delay(30_000L)
-                if (!ble.isImageBusy && state == BleManager.ConnState.CONNECTED && mcastSelected.isEmpty()) {
+                val inSendFlow = dlgNode != null || textDlgNode != null
+                        || imgTargetNode != null || imgCropBitmap != null || imgPreviewData != null
+                if (!ble.isImageBusy && !inSendFlow
+                    && state == BleManager.ConnState.CONNECTED && mcastSelected.isEmpty()) {
                     if (ble.queryTopology()) addLog("→ 自动刷新拓扑")
                 }
             }
@@ -481,7 +484,11 @@ fun MeshApp(
                 }
                 if (curState is BleManager.ImageSendState.Done || curState is BleManager.ImageSendState.Cancelled
                     || curState is BleManager.ImageSendState.MulticastDone) {
-                    kotlinx.coroutines.delay(3000); ble.resetImageSendState()
+                    // queryTopology() 是非挂起函数，发出 BLE 包后立即返回，响应由 BleManager 异步处理
+                    // 必须在 resetImageSendState() 之前调用，否则 LaunchedEffect 重新触发导致协程被取消
+                    if (ble.queryTopology()) addLog("→ 传输后自动刷新拓扑")
+                    kotlinx.coroutines.delay(3000) // 卡片固定展示 3s，拓扑在此期间异步刷新
+                    ble.resetImageSendState()
                 }
             }
         }
