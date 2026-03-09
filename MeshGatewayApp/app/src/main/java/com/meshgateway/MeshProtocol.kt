@@ -54,6 +54,7 @@ object MeshProtocol {
 
     /* ── 取模模式 ── */
     const val IMG_MODE_H_LSB    = 0x00
+    const val IMG_MODE_RLE      = 0x01   // RLE 游程编码压缩
 
     /* ── 传输模式 ── */
     const val IMG_XFER_FAST     = 0x00   // 网关流控 (v2 默认)

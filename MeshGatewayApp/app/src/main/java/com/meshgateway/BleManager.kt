@@ -490,7 +490,8 @@ class BleManager(private val context: Context) {
      * ════════════════════════════════════════════════════════════ */
 
     /** v3: 组播发送图片到多个目标节点 */
-    fun sendImageMulticast(targets: List<Int>, data: ByteArray, width: Int, height: Int): Boolean {
+    fun sendImageMulticast(targets: List<Int>, data: ByteArray, width: Int, height: Int,
+                           imageMode: Int = MeshProtocol.IMG_MODE_H_LSB): Boolean {
         if (targets.isEmpty() || targets.size > 8) return false
         val curState = _imageSendState.value
         if (curState is ImageSendState.Sending || curState is ImageSendState.WaitingAck
@@ -517,7 +518,7 @@ class BleManager(private val context: Context) {
                 "${width}x${height} data=${data.size}B pkts=$imgTotalPkts")
 
         // 1) 发送 MCAST_START
-        sendRaw(MeshProtocol.buildImageMulticastStart(targets, data.size, imgTotalPkts, width, height, 0))
+        sendRaw(MeshProtocol.buildImageMulticastStart(targets, data.size, imgTotalPkts, width, height, imageMode))
 
         // 2) 开始发送数据分包 (FAST 模式)
         _imageSendState.value = ImageSendState.Sending(0, imgTotalPkts, ImageSendMode.FAST)
@@ -527,7 +528,8 @@ class BleManager(private val context: Context) {
     }
 
     fun sendImage(dstAddr: Int, data: ByteArray, width: Int, height: Int,
-                  mode: ImageSendMode = ImageSendMode.FAST): Boolean {
+                  mode: ImageSendMode = ImageSendMode.FAST,
+                  imageMode: Int = MeshProtocol.IMG_MODE_H_LSB): Boolean {
 
         val curState = _imageSendState.value
         if (curState is ImageSendState.Sending || curState is ImageSendState.WaitingAck
@@ -554,7 +556,7 @@ class BleManager(private val context: Context) {
 
         // 1) 发送 START 帧 (xfer: FAST=0, ACK=1)
         val xfer = if (mode == ImageSendMode.ACK) MeshProtocol.IMG_XFER_ACK else MeshProtocol.IMG_XFER_FAST
-        sendRaw(MeshProtocol.buildImageStart(dstAddr, data.size, imgTotalPkts, width, height, xfer = xfer))
+        sendRaw(MeshProtocol.buildImageStart(dstAddr, data.size, imgTotalPkts, width, height, mode = imageMode, xfer = xfer))
 
         // 2) 开始发送数据分包
         _imageSendState.value = ImageSendState.Sending(0, imgTotalPkts, mode)

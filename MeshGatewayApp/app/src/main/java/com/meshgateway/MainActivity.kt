@@ -65,6 +65,7 @@ import java.text.SimpleDateFormat
 import java.util.*
 import java.io.File
 import java.io.FileOutputStream
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
@@ -433,20 +434,21 @@ fun MeshApp(
             /* ── 预览 & 发送 ── */
             imgPreviewData?.let { data ->
                 ImagePreviewDialog(data, onDismiss = { imgPreviewData = null; imgTargetNode = null; mcastSendTargets = emptyList() },
-                    onSend = { processedData, w, h, mode, previewBmp ->
+                    onSend = { processedData, w, h, mode, imgMode, previewBmp ->
+                        val rleTip = if (imgMode == MeshProtocol.IMG_MODE_RLE) " RLE" else ""
                         if (data.multicastTargets.isNotEmpty()) {
-                            val ok = ble.sendImageMulticast(data.multicastTargets, processedData, w, h)
+                            val ok = ble.sendImageMulticast(data.multicastTargets, processedData, w, h, imgMode)
                             if (ok) {
                                 pendingSaveBitmap = previewBmp
                                 pendingSaveAddrs = data.multicastTargets
-                                addLog("→ 组播图片 ${w}x${h} → ${data.multicastTargets.size}个节点 ${processedData.size}B")
+                                addLog("→ 组播图片 ${w}x${h} → ${data.multicastTargets.size}个节点 ${processedData.size}B$rleTip")
                             } else addLog("组播发送失败 (正在发送中或未连接)")
                         } else {
-                            val ok = ble.sendImage(data.node.addr, processedData, w, h, mode)
+                            val ok = ble.sendImage(data.node.addr, processedData, w, h, mode, imgMode)
                             if (ok) {
                                 pendingSaveBitmap = previewBmp
                                 pendingSaveAddrs = listOf(data.node.addr)
-                                addLog("→ 图片 ${w}x${h} → 0x${h4(data.node.addr)} ${processedData.size}B ${if (mode == BleManager.ImageSendMode.FAST) "快速" else "ACK"} ${data.node.hops}跳")
+                                addLog("→ 图片 ${w}x${h} → 0x${h4(data.node.addr)} ${processedData.size}B$rleTip ${if (mode == BleManager.ImageSendMode.FAST) "快速" else "ACK"} ${data.node.hops}跳")
                             } else addLog("图片发送失败 (正在发送中或未连接)")
                         }
                         imgPreviewData = null; imgTargetNode = null; mcastSendTargets = emptyList()
@@ -496,7 +498,31 @@ fun MeshApp(
 }
 
 /* ════════════════════════════════════════════════════════════
- *  扫描页 (不变)
+ *  星闪 (NearLink/SLE) 图标 — 4 角星形
+ * ════════════════════════════════════════════════════════════ */
+
+@Composable
+fun NearLinkIcon(modifier: Modifier = Modifier, color: Color = MaterialTheme.colorScheme.primary) {
+    Canvas(modifier = modifier) {
+        val path = androidx.compose.ui.graphics.Path()
+        val cx = size.width / 2f
+        val cy = size.height / 2f
+        val r1 = size.minDimension / 2f   // 外半径
+        val r2 = size.minDimension / 9f   // 内半径（尖锐4角星）
+        for (i in 0 until 8) {
+            val angle = Math.PI * i / 4.0 - Math.PI / 2.0
+            val r = if (i % 2 == 0) r1 else r2
+            val x = cx + (r * Math.cos(angle)).toFloat()
+            val y = cy + (r * Math.sin(angle)).toFloat()
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        path.close()
+        drawPath(path, color)
+    }
+}
+
+/* ════════════════════════════════════════════════════════════
+ *  扫描页
  * ════════════════════════════════════════════════════════════ */
 
 @Composable
@@ -519,7 +545,7 @@ fun ScanPage(scanning: Boolean, devices: List<BleManager.ScannedDevice>, onScan:
             items(devices) { dev ->
                 Card(Modifier.fillMaxWidth().clickable { onPick(dev) }, colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface), shape = RoundedCornerShape(12.dp)) {
                     Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Default.Bluetooth, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(32.dp)); Spacer(Modifier.width(12.dp))
+                        NearLinkIcon(modifier = Modifier.size(28.dp), color = MaterialTheme.colorScheme.primary); Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) { Text(dev.name, fontWeight = FontWeight.Bold, color = Color.White); Text(dev.address, fontSize = 12.sp, color = Color.Gray) }
                         Text("${dev.rssi} dBm", fontSize = 12.sp, color = if (dev.rssi > -65) Color(0xFF4CAF50) else Color(0xFFFFA726))
                     }
@@ -791,7 +817,7 @@ fun NodeActionDialog(node: MeshNode, lastSentBitmap: Bitmap? = null, onDismiss: 
     AlertDialog(onDismissRequest = onDismiss, containerColor = MaterialTheme.colorScheme.surface,
         title = { Text("0x${h4(node.addr)}", color = Color.White) },
         text = {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.verticalScroll(rememberScrollState())) {
                 Text(when (node.hops) { 0 -> "网关 (本机)"; 1 -> "直连节点"; else -> "${node.hops} 跳路由" }, fontSize = 12.sp, color = Color.Gray, modifier = Modifier.align(Alignment.Start))
                 Spacer(Modifier.height(12.dp))
 
@@ -799,9 +825,15 @@ fun NodeActionDialog(node: MeshNode, lastSentBitmap: Bitmap? = null, onDismiss: 
                 if (lastSentBitmap != null) {
                     Text("上次发送的图片", fontSize = 11.sp, color = Color.Gray, modifier = Modifier.align(Alignment.Start))
                     Spacer(Modifier.height(6.dp))
+                    // 限制预览图最大高度，避免竖版图片在对话框中过高
+                    val maxPrevH = (LocalConfiguration.current.screenHeightDp * 0.38f).dp
                     Box(
                         Modifier.fillMaxWidth(0.6f)
-                            .aspectRatio(lastSentBitmap.width.toFloat() / lastSentBitmap.height)
+                            .heightIn(max = maxPrevH)
+                            .aspectRatio(
+                                lastSentBitmap.width.toFloat() / lastSentBitmap.height,
+                                matchHeightConstraintsFirst = lastSentBitmap.height > lastSentBitmap.width
+                            )
                             .border(1.dp, Color.Gray.copy(alpha = 0.3f), RoundedCornerShape(6.dp))
                             .clip(RoundedCornerShape(6.dp)).background(Color.White),
                         contentAlignment = Alignment.Center
@@ -845,10 +877,13 @@ fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, multicastCount: Int 
 
     var selectedRes by remember { mutableStateOf(IMG_RESOLUTIONS[0]) }
 
+    // 旋转后的图片（顺时针每次 90°）
+    var rotatedBitmap by remember { mutableStateOf(originalBitmap) }
+
     // 裁剪框 — 归一化坐标 [0,1] 相对于图片
     // normAR = 裁剪框在归一化空间中的宽高比: (right-left)/(bottom-top)
-    val imgW = originalBitmap.width.toFloat()
-    val imgH = originalBitmap.height.toFloat()
+    val imgW = rotatedBitmap.width.toFloat()
+    val imgH = rotatedBitmap.height.toFloat()
     fun calcNormAR(res: ImageResolution) = res.width.toFloat() * imgH / (res.height.toFloat() * imgW)
 
     var cropL by remember { mutableFloatStateOf(0f) }
@@ -856,8 +891,8 @@ fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, multicastCount: Int 
     var cropR by remember { mutableFloatStateOf(1f) }
     var cropB by remember { mutableFloatStateOf(1f) }
 
-    // 当分辨率变化时重置裁剪框
-    LaunchedEffect(selectedRes) {
+    // 当分辨率或图片旋转变化时重置裁剪框
+    LaunchedEffect(selectedRes, rotatedBitmap) {
         val nar = calcNormAR(selectedRes)
         if (imgW / imgH > selectedRes.width.toFloat() / selectedRes.height) {
             val cw = nar; cropL = (1f - cw) / 2f; cropR = cropL + cw; cropT = 0f; cropB = 1f
@@ -869,6 +904,11 @@ fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, multicastCount: Int 
     var boxSize by remember { mutableStateOf(IntSize.Zero) }
     val normAR = calcNormAR(selectedRes)
     val handleRadius = 40f  // 触摸热区 (px)
+
+    // 图片画布最大高度：屏幕高度 90% 减去标题/分辨率选择/按钮等固定高度约 210dp
+    val screenHeightDp = LocalConfiguration.current.screenHeightDp.dp
+    val maxImageHeight = (screenHeightDp * 0.9f - 220.dp).coerceAtLeast(160.dp)
+    val isPortraitImage = imgH > imgW
 
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Card(Modifier.fillMaxWidth(0.92f), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E2E))) {
@@ -891,13 +931,18 @@ fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, multicastCount: Int 
                 Spacer(Modifier.height(12.dp))
 
                 // 图片 + 裁剪框叠加
+                // 竖版图片：以 maxImageHeight 为高度上限，宽度由宽高比推算（避免超出屏幕）
+                // 横版图片：以对话框宽度为准，高度由宽高比决定（行为与原来一致）
                 Box(
-                    Modifier.fillMaxWidth()
-                        .aspectRatio(imgW / imgH)
+                    Modifier
+                        .heightIn(max = maxImageHeight)
+                        .aspectRatio(imgW / imgH, matchHeightConstraintsFirst = isPortraitImage)
+                        .align(Alignment.CenterHorizontally)
                         .clip(RoundedCornerShape(8.dp))
                         .onSizeChanged { boxSize = it }
                 ) {
-                    Image(bitmap = originalBitmap.asImageBitmap(), contentDescription = null,
+                    // 修复：显示旋转后的图片
+                    Image(bitmap = rotatedBitmap.asImageBitmap(), contentDescription = null,
                         modifier = Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds)
 
                     val bw = boxSize.width.toFloat()
@@ -1000,12 +1045,32 @@ fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, multicastCount: Int 
                             drawCircle(primaryColor, hr - 2.dp.toPx(), c)
                         }
                     }
+                    // 旋转按钮置于 Canvas 之后，确保触摸层级高于 Canvas，点击可响应
+                    IconButton(
+                        onClick = {
+                            val matrix = Matrix()
+                            matrix.postRotate(90f)
+                            rotatedBitmap = Bitmap.createBitmap(
+                                rotatedBitmap, 0, 0,
+                                rotatedBitmap.width, rotatedBitmap.height,
+                                matrix, true
+                            )
+                        },
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(6.dp)
+                            .background(Color.White, CircleShape)
+                            .size(34.dp)
+                    ) {
+                        Icon(Icons.Default.RotateRight, contentDescription = "旋转",
+                            tint = Color(0xFF212121), modifier = Modifier.size(20.dp))
+                    }
                 }
 
                 Spacer(Modifier.height(14.dp))
 
-                // 按钮
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                // 按钮行：右对齐（取消 / 确认裁剪）
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End, verticalAlignment = Alignment.CenterVertically) {
                     TextButton(onClick = onDismiss) { Text("取消", color = Color.Gray) }
                     Spacer(Modifier.width(8.dp))
                     Button(onClick = {
@@ -1013,7 +1078,7 @@ fun CropImageDialog(originalBitmap: Bitmap, node: MeshNode, multicastCount: Int 
                         val py = (cropT * imgH).toInt().coerceAtLeast(0)
                         val pw = ((cropR - cropL) * imgW).toInt().coerceAtLeast(1).coerceAtMost(imgW.toInt() - px)
                         val ph = ((cropB - cropT) * imgH).toInt().coerceAtLeast(1).coerceAtMost(imgH.toInt() - py)
-                        val cropped = Bitmap.createBitmap(originalBitmap, px, py, pw, ph)
+                        val cropped = Bitmap.createBitmap(rotatedBitmap, px, py, pw, ph)
                         onConfirm(cropped, selectedRes)
                     }, colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)) {
                         Icon(Icons.Default.Crop, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text("确认裁剪")
@@ -1041,7 +1106,7 @@ data class ImagePreviewData(
 
 @Composable
 fun ImagePreviewDialog(data: ImagePreviewData, onDismiss: () -> Unit,
-                       onSend: (ByteArray, Int, Int, BleManager.ImageSendMode, Bitmap) -> Unit) {
+                       onSend: (ByteArray, Int, Int, BleManager.ImageSendMode, Int, Bitmap) -> Unit) {
 
     var selectedMode by remember { mutableStateOf(BleManager.ImageSendMode.FAST) }
     var zoomBitmap by remember { mutableStateOf<Bitmap?>(null) }
@@ -1056,7 +1121,7 @@ fun ImagePreviewDialog(data: ImagePreviewData, onDismiss: () -> Unit,
     AlertDialog(onDismissRequest = onDismiss, containerColor = MaterialTheme.colorScheme.surface,
         title = { Text(if (data.multicastTargets.isNotEmpty()) "组播发送到 ${data.multicastTargets.size} 个节点" else "发送到 0x${h4(data.node.addr)}", color = Color.White, fontSize = 16.sp) },
         text = {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.verticalScroll(rememberScrollState())) {
 
                 // 左右对比 — 相同显示大小
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1086,7 +1151,11 @@ fun ImagePreviewDialog(data: ImagePreviewData, onDismiss: () -> Unit,
                 }
 
                 Spacer(Modifier.height(2.dp))
-                Text("点击图片放大 | ${data.resolution.label} | ${processed.dataSize}B | ${processed.packetCount}包",
+                val compressionText = if (processed.isCompressed) {
+                    val ratio = processed.dataSize * 100 / processed.rawSize
+                    "原始${processed.rawSize}B → RLE ${processed.dataSize}B ($ratio%)"
+                } else "${processed.dataSize}B"
+                Text("点击图片放大 | ${data.resolution.label} | $compressionText | ${processed.packetCount}包",
                     fontSize = 10.sp, color = Color.Gray)
 
                 Spacer(Modifier.height(12.dp))
@@ -1103,9 +1172,10 @@ fun ImagePreviewDialog(data: ImagePreviewData, onDismiss: () -> Unit,
             }
         },
         confirmButton = {
-            Button(onClick = { onSend(processed.imageData, data.resolution.width, data.resolution.height, selectedMode, processed.previewBitmap) },
+            val sizeLabel = if (processed.isCompressed) "${processed.dataSize}B RLE" else "${processed.dataSize}B"
+            Button(onClick = { onSend(processed.imageData, data.resolution.width, data.resolution.height, selectedMode, processed.imageMode, processed.previewBitmap) },
                 colors = ButtonDefaults.buttonColors(containerColor = if (data.multicastTargets.isNotEmpty()) Color(0xFF9C27B0) else MaterialTheme.colorScheme.primary)) {
-                Icon(Icons.Default.Send, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text(if (data.multicastTargets.isNotEmpty()) "组播发送 (${processed.dataSize}B)" else "发送 (${processed.dataSize}B)")
+                Icon(Icons.Default.Send, null, Modifier.size(16.dp)); Spacer(Modifier.width(6.dp)); Text(if (data.multicastTargets.isNotEmpty()) "组播发送 ($sizeLabel)" else "发送 ($sizeLabel)")
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消", color = Color.Gray) } }
@@ -1121,8 +1191,10 @@ fun ZoomImageDialog(bitmap: Bitmap, title: String, onDismiss: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, containerColor = Color(0xFF0A0A14), modifier = Modifier.fillMaxWidth(0.95f),
         title = { Text(title, color = Color.White, fontSize = 14.sp) },
         text = {
-            Box(Modifier.fillMaxWidth().border(1.dp, Color.Gray.copy(alpha = 0.2f), RoundedCornerShape(4.dp)).clip(RoundedCornerShape(4.dp)).background(Color.White), contentAlignment = Alignment.Center) {
-                Image(bitmap.asImageBitmap(), title, Modifier.fillMaxWidth(), contentScale = ContentScale.FillWidth)
+            // 限制最大高度，避免竖版图片过高导致对话框溢出
+            val maxZoomHeight = (LocalConfiguration.current.screenHeightDp * 0.65f).dp
+            Box(Modifier.fillMaxWidth().heightIn(max = maxZoomHeight).border(1.dp, Color.Gray.copy(alpha = 0.2f), RoundedCornerShape(4.dp)).clip(RoundedCornerShape(4.dp)).background(Color.White), contentAlignment = Alignment.Center) {
+                Image(bitmap.asImageBitmap(), title, Modifier.fillMaxWidth(), contentScale = ContentScale.Fit)
             }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("关闭", color = MaterialTheme.colorScheme.primary) } }
@@ -1167,7 +1239,10 @@ data class ProcessedImage(
     val previewBitmap: Bitmap,
     val imageData: ByteArray,
     val dataSize: Int,
-    val packetCount: Int
+    val packetCount: Int,
+    val rawSize: Int = dataSize,
+    val isCompressed: Boolean = false,
+    val imageMode: Int = MeshProtocol.IMG_MODE_H_LSB
 )
 
 object ImageUtils {
@@ -1203,8 +1278,16 @@ object ImageUtils {
                 }
             }
         }
-        val pktCount = (totalBytes + MeshProtocol.IMG_PKT_PAYLOAD - 1) / MeshProtocol.IMG_PKT_PAYLOAD
-        return ProcessedImage(bwBitmap, data, totalBytes, pktCount)
+
+        // RLE 压缩: 仅当压缩后更小时使用
+        val totalPixels = targetW * targetH
+        val compressed = ImageRleEncoder.encode(data, totalPixels)
+        val useRle = compressed.size < totalBytes
+        val sendData = if (useRle) compressed else data
+        val imgMode = if (useRle) MeshProtocol.IMG_MODE_RLE else MeshProtocol.IMG_MODE_H_LSB
+
+        val pktCount = (sendData.size + MeshProtocol.IMG_PKT_PAYLOAD - 1) / MeshProtocol.IMG_PKT_PAYLOAD
+        return ProcessedImage(bwBitmap, sendData, sendData.size, pktCount, totalBytes, useRle, imgMode)
     }
 }
 
