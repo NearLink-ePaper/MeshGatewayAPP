@@ -1471,8 +1471,14 @@ object ImageUtils {
         matrix.postRotate(-90f)
         val landscape = Bitmap.createBitmap(scaled, 0, 0, w, h, matrix, true)
 
-        // JPEG 压缩, 上限 43000B (设备接收缓冲区限制)
-        val maxBytes = 43000
+        // JPEG 压缩, 不同画质对应不同大小上限
+        // 高(Q55): 43000B (设备最大), 中(Q40): 35000B, 低(Q25): 25000B
+        // 800×480 图片 Q=0 时约 15-25KB，低档上限不能低于此
+        val maxBytes = when {
+            quality >= 55 -> 43000
+            quality >= 40 -> 35000
+            else          -> 25000
+        }
         var q = quality
         var jpegData: ByteArray
         do {
@@ -1480,7 +1486,7 @@ object ImageUtils {
             landscape.compress(Bitmap.CompressFormat.JPEG, q, baos)
             jpegData = baos.toByteArray()
             q -= 5
-        } while (jpegData.size > maxBytes && q >= 20)
+        } while (jpegData.size > maxBytes && q >= 5)
         val actualQ = q + 5
 
         // 预览: JPEG 解码 → FS 6色抖动 → 旋转回 portrait
